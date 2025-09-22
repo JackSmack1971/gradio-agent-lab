@@ -10,6 +10,10 @@ HEADERS = {
     "X-Title": "Agent Lab (Gradio 5)",        # optional attribution
 }
 
+DEFAULT_MODEL_ID = "openrouter/auto"
+DEFAULT_MODEL_CHOICES: tuple[tuple[str, str], ...] = ((DEFAULT_MODEL_ID, DEFAULT_MODEL_ID),)
+DEFAULT_MODELS_RAW = [{"id": DEFAULT_MODEL_ID, "name": DEFAULT_MODEL_ID}]
+
 # =========================================================
 # Models API helpers (sidebar metadata)  ??????????????????
 # =========================================================
@@ -18,9 +22,28 @@ HEADERS = {
 def fetch_models_raw():
     """Fetch full model list once (cached)."""
     url = f"{BASE_URL}/models"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json().get("data", [])
+    headers = {k: v for k, v in HEADERS.items() if v}
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response else None
+        # Security: ensure we do not leak auth failures—warn user and fall back safely.
+        if status in {401, 403}:
+            gr.Warning("OpenRouter API key was rejected while loading models; using defaults.")
+        else:
+            gr.Warning("Unable to load OpenRouter models; using default list.")
+        return DEFAULT_MODELS_RAW
+    except requests.RequestException:
+        # Network failures should not break the UI; warn and fall back to the default.
+        gr.Warning("OpenRouter models endpoint unreachable; using default list.")
+        return DEFAULT_MODELS_RAW
+    try:
+        data = response.json().get("data", [])
+    except ValueError:
+        gr.Warning("Received invalid response from OpenRouter; using default model list.")
+        return DEFAULT_MODELS_RAW
+    return data or DEFAULT_MODELS_RAW
 
 def list_model_choices():
     """Dropdown choices -> (label, value)."""
@@ -31,6 +54,8 @@ def list_model_choices():
         if not mid:
             continue
         choices.append((mid, mid))
+    if not choices:
+        return list(DEFAULT_MODEL_CHOICES)
     # preferred first
     preferred = [
         "anthropic/claude-3.5-sonnet",
@@ -43,7 +68,7 @@ def list_model_choices():
     ]
     priority = {m:i for i,m in enumerate(preferred)}
     choices.sort(key=lambda x: (priority.get(x[1], 10_000), x[1]))
-    return choices or [("openrouter/auto", "openrouter/auto")]
+    return choices
 
 def find_model(md_id: str):
     """Return the raw model object by id."""
@@ -183,7 +208,7 @@ def reply_fn(history, model, system_prompt, temperature, max_tokens, top_p, seed
 # UI  ?????????????????????????????????????????????????????
 # =========================================================
 
-MODEL_CHOICES = list_model_choices()
+MODEL_CHOICES = list_model_choices() or list(DEFAULT_MODEL_CHOICES)
 
 with gr.Blocks(title="Agent Lab · OpenRouter", theme="soft") as demo:
     gr.Markdown("# Agent Lab · OpenRouter\nQuickly A/B system prompts and models (streaming)")
@@ -240,9 +265,13 @@ with gr.Blocks(title="Agent Lab · OpenRouter", theme="soft") as demo:
     # ?? Refresh button: bust cache, reload choices and sidebar
     def refresh_models(current_model):
         fetch_models_raw.cache_clear()
-        new_choices = list_model_choices()
-        # If current selection disappeared, fall back to first
-        new_value = current_model if any(v == current_model for _, v in new_choices) else new_choices[0][1]
+        new_choices = list_model_choices() or list(DEFAULT_MODEL_CHOICES)
+        # If current selection disappeared, fall back to first safe choice.
+        new_value = (
+            current_model
+            if any(v == current_model for _, v in new_choices)
+            else (new_choices[0][1] if new_choices else DEFAULT_MODEL_ID)
+        )
         md = build_model_markdown(new_value)
         return (
             gr.Dropdown(choices=new_choices, value=new_value),
