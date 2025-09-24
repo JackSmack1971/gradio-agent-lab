@@ -34,6 +34,17 @@ from urllib3.util.retry import Retry
 
 
 # =============================================================================
+# Constants
+# =============================================================================
+
+RETRY_STATUS_FORCELIST: Tuple[int, ...] = (429, 500, 502, 503, 504)
+RETRY_ALLOWED_METHODS: Tuple[str, ...] = ("HEAD", "GET", "OPTIONS", "POST")
+STREAM_TIMEOUT_SECONDS: int = 300
+SSE_DATA_PREFIX: str = "data: "
+SSE_DONE_SENTINEL: str = "[DONE]"
+
+
+# =============================================================================
 # Type Definitions & Data Structures
 # =============================================================================
 
@@ -176,8 +187,8 @@ class OpenRouterClient:
         retry_strategy = Retry(
             total=self.config.max_retries,
             backoff_factor=self.config.backoff_factor,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+            status_forcelist=RETRY_STATUS_FORCELIST,
+            allowed_methods=frozenset(RETRY_ALLOWED_METHODS),
         )
         
         adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -217,7 +228,61 @@ class OpenRouterClient:
             ) from exc
         except RequestException as exc:
             raise OpenRouterError(f"Request failed: {exc}") from exc
-    
+
+    def _parse_models_response(self, response: requests.Response) -> List[ModelInfo]:
+        """Validate and extract model data from the API response."""
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise OpenRouterError(
+                "Invalid JSON response from OpenRouter models endpoint"
+            ) from exc
+
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise OpenRouterError(
+                "Invalid payload structure from OpenRouter models endpoint"
+            )
+
+        models: List[ModelInfo] = []
+        for entry in data:
+            if isinstance(entry, dict):
+                models.append(cast(ModelInfo, entry))
+            else:
+                raise OpenRouterError(
+                    "Invalid model entry format from OpenRouter models endpoint"
+                )
+
+        return models
+
+    def _iter_stream_events(self, response: requests.Response) -> Iterator[str]:
+        """Yield text deltas from a streaming chat completion response."""
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line or not raw_line.startswith(SSE_DATA_PREFIX):
+                continue
+
+            data_content = raw_line[len(SSE_DATA_PREFIX) :].strip()
+            if not data_content:
+                continue
+
+            if data_content == SSE_DONE_SENTINEL:
+                break
+
+            try:
+                chunk = json.loads(data_content)
+            except json.JSONDecodeError:
+                # Skip malformed JSON chunks
+                continue
+
+            delta = (
+                chunk.get("choices", [{}])[0]
+                .get("delta", {})
+                .get("content")
+            )
+
+            if isinstance(delta, str) and delta:
+                yield delta
+
     @lru_cache(maxsize=1)
     def fetch_models(self) -> List[ModelInfo]:
         """
@@ -230,18 +295,11 @@ class OpenRouterClient:
             OpenRouterError: If the API request fails.
         """
         url = urljoin(self.config.base_url, "models")
-        
+
         with self._handle_api_errors():
             response = self.session.get(url, timeout=self.config.timeout)
             response.raise_for_status()
-            
-            try:
-                data = response.json()
-                return data.get("data", [])
-            except ValueError as exc:
-                raise OpenRouterError(
-                    "Invalid JSON response from OpenRouter models endpoint"
-                ) from exc
+            return self._parse_models_response(response)
     
     def stream_chat_completion(
         self,
@@ -289,33 +347,13 @@ class OpenRouterClient:
         
         with self._handle_api_errors():
             with self.session.post(
-                url, 
-                json=payload, 
-                stream=True, 
-                timeout=300  # Longer timeout for streaming
+                url,
+                json=payload,
+                stream=True,
+                timeout=STREAM_TIMEOUT_SECONDS,  # Longer timeout for streaming
             ) as response:
                 response.raise_for_status()
-                
-                for raw_line in response.iter_lines(decode_unicode=True):
-                    if not raw_line or not raw_line.startswith("data: "):
-                        continue
-                        
-                    data_content = raw_line[6:].strip()  # Remove "data: " prefix
-                    if data_content == "[DONE]":
-                        break
-                    
-                    try:
-                        chunk = json.loads(data_content)
-                        delta_content = (
-                            chunk.get("choices", [{}])[0]
-                            .get("delta", {})
-                            .get("content", "")
-                        )
-                        if delta_content:
-                            yield delta_content
-                    except json.JSONDecodeError:
-                        # Skip malformed JSON chunks
-                        continue
+                yield from self._iter_stream_events(response)
 
 
 # =============================================================================
