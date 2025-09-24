@@ -60,6 +60,7 @@ RETRY_ALLOWED_METHODS: Tuple[str, ...] = ("HEAD", "GET", "OPTIONS", "POST")
 STREAM_TIMEOUT_SECONDS: int = 300
 SSE_DATA_PREFIX: str = "data: "
 SSE_DONE_SENTINEL: str = "[DONE]"
+CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 # =============================================================================
@@ -915,11 +916,13 @@ class ModelMetadataService:
 
 class GradioAgentLab:
     """Main application class for the Gradio Agent Lab interface."""
-    
+
+    _VALID_CHAT_ROLES: Tuple[str, ...] = ("system", "user", "assistant", "tool")
+
     def __init__(self, config: Optional[OpenRouterConfig] = None) -> None:
         """
         Initialize the Gradio Agent Lab application.
-        
+
         Args:
             config: OpenRouter configuration. If None, creates default config.
         """
@@ -930,34 +933,115 @@ class GradioAgentLab:
         # Cache initial model choices
         self.model_choices = self.metadata_service.get_model_choices()
     
+    def _sanitize_chat_content(self, content: Any) -> str:
+        """Normalize chat content by stripping control characters and whitespace."""
+
+        if content is None:
+            return ""
+
+        text = str(content)
+        # Normalize carriage returns before stripping control characters.
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = CONTROL_CHAR_PATTERN.sub("", normalized)
+        return cleaned.strip()
+
+    def _normalize_chat_message(self, message: Any) -> Optional[ChatMessage]:
+        """Validate and sanitize a raw chat message payload."""
+
+        if not isinstance(message, dict):
+            return None
+
+        role_value = message.get("role")
+        if not isinstance(role_value, str):
+            return None
+
+        role = role_value.strip().lower()
+        if role not in self._VALID_CHAT_ROLES:
+            return None
+
+        sanitized_content = self._sanitize_chat_content(message.get("content"))
+        if not sanitized_content:
+            return None
+
+        return {"role": role, "content": sanitized_content}
+
     def _build_chat_messages(
-        self, 
-        history: List[ChatMessage], 
+        self,
+        history: List[ChatMessage],
         system_prompt: str
     ) -> List[ChatMessage]:
-        """
-        Build the complete message list including system prompt.
-        
-        Args:
-            history: Chat message history from Gradio.
-            system_prompt: System instructions to prepend.
-            
-        Returns:
-            Complete list of chat messages.
-        """
+        """Build the complete message list including sanitized system prompt."""
+
         messages: List[ChatMessage] = []
-        
-        # Add system prompt if provided
-        if system_prompt and system_prompt.strip():
-            messages.append({
-                "role": "system", 
-                "content": system_prompt.strip()
-            })
-        
-        # Add conversation history
-        messages.extend(history)
-        
+
+        sanitized_system = self._sanitize_chat_content(system_prompt)
+        if sanitized_system:
+            messages.append({"role": "system", "content": sanitized_system})
+
+        for raw_message in history:
+            normalized = self._normalize_chat_message(raw_message)
+            if normalized:
+                messages.append(normalized)
+
         return messages
+
+    def _format_error_message(self, icon: str, category: str, detail: str) -> str:
+        """Generate a user-facing, sanitized error message for the chat stream."""
+
+        sanitized_category = self._sanitize_chat_content(category) or "Error"
+        sanitized_detail = self._sanitize_chat_content(detail) or "An unknown error occurred."
+        icon_display = icon or "❌"
+        return f"{icon_display} **{sanitized_category}**: {sanitized_detail}"
+
+    def _build_sidebar_error_markdown(self, model_id: str) -> str:
+        """Produce a safe fallback markdown payload for sidebar failures."""
+
+        safe_model_id = self._sanitize_chat_content(model_id) or self.config.default_model
+        return f"### Model\n`{safe_model_id}`\n\n*Error loading metadata.*"
+
+    @staticmethod
+    def _build_sidebar_payload(model_id: str, markdown: str) -> Tuple[str, str]:
+        """Package sidebar updates in a consistent tuple format."""
+
+        return model_id, markdown
+
+    def _build_dropdown_update(
+        self,
+        choices: List[Tuple[str, str]],
+        value: str,
+    ) -> ComponentUpdate:
+        """Create a sanitized Gradio component update payload for dropdowns."""
+
+        sanitized_choices = self._sanitize_model_choices(choices)
+        if not sanitized_choices:
+            sanitized_choices = [(self.config.default_model, self.config.default_model)]
+
+        sanitized_value = self._sanitize_chat_content(value)
+        if not sanitized_value:
+            sanitized_value = sanitized_choices[0][1]
+
+        valid_values = {choice[1] for choice in sanitized_choices}
+        if sanitized_value not in valid_values:
+            sanitized_value = sanitized_choices[0][1]
+
+        update_payload = gr.update(choices=sanitized_choices, value=sanitized_value)
+        return cast(ComponentUpdate, update_payload)
+
+    def _sanitize_model_choices(
+        self, choices: List[Tuple[str, str]]
+    ) -> List[Tuple[str, str]]:
+        """Remove unsafe entries from model dropdown choices."""
+
+        sanitized: List[Tuple[str, str]] = []
+        for label, value in choices:
+            sanitized_value = self._sanitize_chat_content(value)
+            if not sanitized_value:
+                continue
+
+            sanitized_label = self._sanitize_chat_content(label) or sanitized_value
+            sanitized.append((sanitized_label, sanitized_value))
+
+        return sanitized
     
     def handle_chat_stream(
         self,
@@ -984,45 +1068,62 @@ class GradioAgentLab:
         Yields:
             Individual content tokens from the streaming response.
         """
+        safe_model = self._sanitize_chat_content(model) or self.config.default_model
+
         try:
             messages = self._build_chat_messages(history, system_prompt)
-            
+
             yield from self.client.stream_chat_completion(
-                model=model,
+                model=safe_model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 top_p=top_p,
                 seed=seed,
             )
-            
+
         except AuthenticationError:
-            yield "❌ **Authentication Error**: Invalid OpenRouter API key. Please check your configuration."
+            yield self._format_error_message(
+                "❌",
+                "Authentication Error",
+                "Invalid OpenRouter API key. Please check your configuration.",
+            )
         except ModelNotFoundError:
-            yield f"❌ **Model Error**: Model '{model}' not found on OpenRouter."
+            yield self._format_error_message(
+                "❌",
+                "Model Error",
+                f"Model '{safe_model}' not found on OpenRouter.",
+            )
         except APIConnectionError:
-            yield "❌ **Connection Error**: Unable to reach OpenRouter API. Please check your internet connection."
+            yield self._format_error_message(
+                "❌",
+                "Connection Error",
+                "Unable to reach OpenRouter API. Please check your internet connection.",
+            )
         except OpenRouterError as exc:
-            yield f"❌ **API Error**: {exc}"
+            yield self._format_error_message("❌", "API Error", str(exc))
         except Exception as exc:
-            yield f"❌ **Unexpected Error**: {exc}"
-    
+            detail = str(exc) or exc.__class__.__name__
+            yield self._format_error_message("❌", "Unexpected Error", detail)
+
     def update_model_sidebar(self, model_id: str) -> Tuple[str, str]:
         """
         Update the model metadata sidebar.
-        
+
         Args:
             model_id: The selected model identifier.
-            
+
         Returns:
             Tuple of (model_id, markdown_content) for UI updates.
         """
+        safe_model_id = self._sanitize_chat_content(model_id) or self.config.default_model
+
         try:
-            markdown_content = self.metadata_service.build_model_markdown(model_id)
+            markdown_content = self.metadata_service.build_model_markdown(safe_model_id)
         except Exception:
-            markdown_content = f"### Model\n`{model_id}`\n\n*Error loading metadata.*"
-        
-        return model_id, markdown_content
+            markdown_content = self._build_sidebar_error_markdown(safe_model_id)
+
+        return self._build_sidebar_payload(safe_model_id, markdown_content)
     
     def refresh_models(self, current_model: str) -> Tuple[ComponentUpdate, str, str]:
         """Refresh the model list from OpenRouter API.
@@ -1041,23 +1142,30 @@ class GradioAgentLab:
 
         # Get fresh model choices
         new_choices = self.metadata_service.get_model_choices()
-        
+        sanitized_choices = self._sanitize_model_choices(new_choices)
+        if not sanitized_choices:
+            sanitized_choices = [(self.config.default_model, self.config.default_model)]
+
+        self.model_choices = sanitized_choices
+
+        safe_current = self._sanitize_chat_content(current_model) or self.config.default_model
+
         # Determine new selected value
-        if any(choice[1] == current_model for choice in new_choices):
-            new_value = current_model
+        available_values = {choice[1] for choice in sanitized_choices}
+        if safe_current in available_values:
+            new_value = safe_current
+        elif sanitized_choices:
+            new_value = sanitized_choices[0][1]
         else:
-            new_value = new_choices[0][1] if new_choices else self.config.default_model
-        
+            new_value = self.config.default_model
+
+        new_value = self._sanitize_chat_content(new_value) or self.config.default_model
+
         # Generate metadata for the selected model
         markdown_content = self.metadata_service.build_model_markdown(new_value)
 
-        # Use gr.update to ensure a dictionary-like payload compatible with
-        # event handlers and validation helpers that rely on ``choices`` and
-        # ``value`` subscripting.
-        dropdown_update = cast(
-            ComponentUpdate,
-            gr.update(choices=new_choices, value=new_value),
-        )
+        # Use helper to ensure consistent update payload.
+        dropdown_update = self._build_dropdown_update(sanitized_choices, new_value)
 
         return dropdown_update, new_value, markdown_content
     
