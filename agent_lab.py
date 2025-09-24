@@ -23,7 +23,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple, TypedDict, Union
+from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple, TypedDict, Union, cast
 from urllib.parse import urljoin
 
 import gradio as gr
@@ -70,6 +70,14 @@ class ModelChoice(TypedDict):
     """Type definition for model dropdown choices."""
     label: str
     value: str
+
+
+class ComponentUpdate(TypedDict, total=False):
+    """Typed representation of a Gradio component update payload."""
+
+    __type__: str
+    choices: List[Tuple[str, str]]
+    value: Optional[str]
 
 
 # =============================================================================
@@ -620,19 +628,21 @@ class GradioAgentLab:
         
         return model_id, markdown_content
     
-    def refresh_models(self, current_model: str) -> Tuple[Dict[str, Any], str, str]:
-        """
-        Refresh the model list from OpenRouter API.
-        
+    def refresh_models(self, current_model: str) -> Tuple[ComponentUpdate, str, str]:
+        """Refresh the model list from OpenRouter API.
+
         Args:
             current_model: Currently selected model.
-            
+
         Returns:
-            Tuple of (dropdown_update, model_id, markdown_content) for UI updates.
+            Tuple of (dropdown_update, model_id, markdown_content) for UI
+            updates. The first element is a Gradio component update payload
+            that exposes ``choices`` and ``value`` for downstream consumers
+            (UI bindings, validation utilities, and tests).
         """
         # Clear the cache to force fresh fetch
         self.client.fetch_models.cache_clear()
-        
+
         # Get fresh model choices
         new_choices = self.metadata_service.get_model_choices()
         
@@ -644,12 +654,16 @@ class GradioAgentLab:
         
         # Generate metadata for the selected model
         markdown_content = self.metadata_service.build_model_markdown(new_value)
-        
-        return (
-            gr.Dropdown(choices=new_choices, value=new_value),
-            new_value,
-            markdown_content,
+
+        # Use gr.update to ensure a dictionary-like payload compatible with
+        # event handlers and validation helpers that rely on ``choices`` and
+        # ``value`` subscripting.
+        dropdown_update = cast(
+            ComponentUpdate,
+            gr.update(choices=new_choices, value=new_value),
         )
+
+        return dropdown_update, new_value, markdown_content
     
     def create_interface(self) -> gr.Blocks:
         """
@@ -859,20 +873,40 @@ def update_sidebar(model_id: str) -> Tuple[str, str]:
     return _get_app().update_model_sidebar(model_id)
 
 
-def refresh_models(current_model: str) -> Tuple[Dict[str, Any], str, str]:
-    """Refresh dropdown choices and sidebar metadata from OpenRouter."""
+def refresh_models(current_model: str) -> Tuple[ComponentUpdate, str, str]:
+    """Refresh dropdown choices and sidebar metadata from OpenRouter.
+
+    The returned ``ComponentUpdate`` preserves ``choices`` and ``value`` keys
+    so downstream callers (UI bindings, tests, or validation scripts) can rely
+    on a dictionary-like contract without needing to inspect Gradio internals.
+    """
 
     dropdown_update, model_id, markdown = _get_app().refresh_models(current_model)
 
     if isinstance(dropdown_update, dict):
-        dropdown_payload = dropdown_update
+        dropdown_payload = cast(ComponentUpdate, dropdown_update)
     elif hasattr(dropdown_update, "get_config"):
-        dropdown_payload = dropdown_update.get_config()
+        config = dropdown_update.get_config()  # type: ignore[call-arg]
+        dropdown_payload = cast(
+            ComponentUpdate,
+            {
+                "__type__": "update",
+                "choices": config.get("choices", []),
+                "value": config.get("value"),
+            },
+        )
     else:
-        dropdown_payload = {
-            "choices": getattr(dropdown_update, "choices", []),
-            "value": getattr(dropdown_update, "value", None),
-        }
+        dropdown_payload = cast(
+            ComponentUpdate,
+            {
+                "__type__": "update",
+                "choices": getattr(dropdown_update, "choices", []),
+                "value": getattr(dropdown_update, "value", None),
+            },
+        )
+
+    if "__type__" not in dropdown_payload:
+        dropdown_payload["__type__"] = "update"
 
     return dropdown_payload, model_id, markdown
 
