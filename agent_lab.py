@@ -5,6 +5,11 @@ This module provides a production-ready, type-safe implementation of a chat inte
 that integrates with OpenRouter's AI model API, featuring comprehensive error handling,
 modern Python patterns, and enterprise architecture standards.
 
+Note:
+    Importing this module requires the ``OPENROUTER_API_KEY`` environment variable
+    to be configured. The module-level singleton validates credential availability
+    before exposing helpers to guard against unauthenticated API usage.
+
 Author: Senior Python Developer
 Version: 2.0.0
 Python: 3.9+
@@ -745,6 +750,131 @@ class GradioAgentLab:
             )
         
         return demo
+
+
+# =============================================================================
+# Module-Level Singleton & Public API
+# =============================================================================
+
+_app: GradioAgentLab | None = None
+
+
+def _get_app() -> GradioAgentLab:
+    """Return a lazily-instantiated :class:`GradioAgentLab` singleton."""
+
+    global _app
+
+    if _app is None:
+        try:
+            # Security: fail fast when the API key is missing to avoid
+            # accidental unauthenticated traffic to OpenRouter.
+            _app = GradioAgentLab()
+        except ValueError as exc:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY environment variable must be set before "
+                "importing or using agent_lab."
+            ) from exc
+
+    return _app
+
+
+demo = _get_app().create_interface()
+
+
+def stream_openrouter(
+    model: str,
+    system_prompt: str,
+    history: List[ChatMessage],
+    temperature: float,
+    max_tokens: int,
+    top_p: float,
+    seed: int,
+) -> Generator[str, None, None]:
+    """Stream chat completions for the provided conversation context."""
+
+    return _get_app().handle_chat_stream(
+        history=history,
+        model=model,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        seed=seed,
+    )
+
+
+def reply_fn(
+    history: List[ChatMessage],
+    model: str,
+    system_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    top_p: float,
+    seed: int,
+) -> Generator[str, None, None]:
+    """Wrapper for Gradio ChatInterface callback signature."""
+
+    return stream_openrouter(
+        model=model,
+        system_prompt=system_prompt,
+        history=history,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        seed=seed,
+    )
+
+
+@lru_cache
+def fetch_models_raw() -> List[ModelInfo]:
+    """Fetch the raw OpenRouter model list with memoization."""
+
+    return _get_app().client.fetch_models()
+
+
+def list_model_choices() -> List[Tuple[str, str]]:
+    """Return dropdown-ready model choices."""
+
+    return _get_app().metadata_service.get_model_choices()
+
+
+MODEL_CHOICES = list_model_choices()
+
+
+def find_model(model_id: str) -> Optional[ModelInfo]:
+    """Locate metadata for the requested model identifier."""
+
+    return _get_app().metadata_service.find_model(model_id)
+
+
+def build_model_markdown(model_id: str) -> str:
+    """Generate Markdown describing the selected model."""
+
+    return _get_app().metadata_service.build_model_markdown(model_id)
+
+
+def update_sidebar(model_id: str) -> Tuple[str, str]:
+    """Return sidebar updates for a newly selected model."""
+
+    return _get_app().update_model_sidebar(model_id)
+
+
+def refresh_models(current_model: str) -> Tuple[Dict[str, Any], str, str]:
+    """Refresh dropdown choices and sidebar metadata from OpenRouter."""
+
+    dropdown_update, model_id, markdown = _get_app().refresh_models(current_model)
+
+    if isinstance(dropdown_update, dict):
+        dropdown_payload = dropdown_update
+    elif hasattr(dropdown_update, "get_config"):
+        dropdown_payload = dropdown_update.get_config()
+    else:
+        dropdown_payload = {
+            "choices": getattr(dropdown_update, "choices", []),
+            "value": getattr(dropdown_update, "value", None),
+        }
+
+    return dropdown_payload, model_id, markdown
 
 
 # =============================================================================
