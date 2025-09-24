@@ -1,2 +1,3 @@
 gradio==5.*
 requests
+hypothesis
