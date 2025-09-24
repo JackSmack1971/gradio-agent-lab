@@ -23,7 +23,25 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple, TypedDict, Union, cast
+import re
+from decimal import Decimal, InvalidOperation
+from textwrap import dedent
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypedDict,
+    Union,
+    cast,
+)
 from urllib.parse import urljoin
 
 import gradio as gr
@@ -362,7 +380,53 @@ class OpenRouterClient:
 
 class ModelMetadataService:
     """Service for processing and formatting model metadata."""
-    
+
+    _DEFAULT_PRIORITY_RANK: int = 10_000
+    _PRICING_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
+        "prompt": ("prompt", "input", "input_token", "input_tokens"),
+        "completion": (
+            "completion",
+            "output",
+            "output_token",
+            "output_tokens",
+        ),
+    }
+    _PROVIDER_PRICING_OVERRIDES: Dict[str, Dict[str, Tuple[str, ...]]] = {
+        "anthropic": {
+            "prompt": ("cache", "cache_prompt"),
+            "completion": ("cache_completion",),
+        },
+        "google": {
+            "prompt": ("cached_prompt",),
+            "completion": ("cached_completion",),
+        },
+    }
+    _MARKDOWN_TEMPLATE: str = dedent(
+        """\
+        ### Model
+        [`{name}`]({permalink})
+
+        **Provider:** `{provider}`
+
+        **Context length:** `{context_length}` tokens
+
+        **Pricing:** {pricing}
+
+        **Modalities:**
+        - Input: `{input_modalities}`
+        - Output: `{output_modalities}`
+
+        **Supported params:** {supported_parameters}
+
+        **Capabilities:** {capabilities}
+
+        **Notes:**
+        {description}
+
+        > Data from OpenRouter **Models API**. Fields vary by provider.
+        """
+    )
+
     def __init__(self, client: OpenRouterClient) -> None:
         """Initialize with OpenRouter client."""
         self.client = client
@@ -370,185 +434,479 @@ class ModelMetadataService:
     def get_model_choices(self) -> List[Tuple[str, str]]:
         """
         Get formatted model choices for dropdown UI component.
-        
+
         Returns:
-            List of (display_name, model_id) tuples sorted by preference.
+            List of (label, value) tuples for model selection.
         """
         try:
-            models = self.client.fetch_models()
+            models = self._get_valid_models()
         except OpenRouterError:
-            # Fall back to default if API fails
             gr.Warning("Unable to fetch models from OpenRouter. Using default.")
-            return [(self.client.config.default_model, self.client.config.default_model)]
-        
-        choices = []
+            fallback = self.client.config.default_model
+            return [(fallback, fallback)]
+
+        choices: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
         for model in models:
-            model_id = model.get("id") or model.get("name")
-            if model_id:
-                choices.append((model_id, model_id))
-        
+            identifier = (model.get("id") or model.get("name") or "").strip()
+            if not identifier or identifier in seen:
+                continue
+            seen.add(identifier)
+            choices.append((identifier, identifier))
+
         if not choices:
-            return [(self.client.config.default_model, self.client.config.default_model)]
-        
-        # Sort by preference
-        preferred = self.client.config.preferred_models
-        priority_map = {model: idx for idx, model in enumerate(preferred)}
-        
-        choices.sort(key=lambda x: (priority_map.get(x[1], 10_000), x[1]))
-        
-        return choices
+            fallback = self.client.config.default_model
+            return [(fallback, fallback)]
+
+        return self._sort_model_choices(choices)
     
     def find_model(self, model_id: str) -> Optional[ModelInfo]:
         """
-        Find model information by ID.
-        
+        Find model information by ID using normalized comparison rules.
+
         Args:
             model_id: The model identifier to search for.
-            
+
         Returns:
             Model information dictionary if found, None otherwise.
         """
+        search_tokens = self._identifier_tokens(model_id)
+        if not search_tokens:
+            return None
+
         try:
-            models = self.client.fetch_models()
-            for model in models:
-                if model.get("id") == model_id or model.get("name") == model_id:
-                    return model
+            models = self._get_valid_models()
         except OpenRouterError:
-            pass
-        
+            return None
+
+        for model in models:
+            candidate_tokens: Set[str] = set()
+            for key in ("id", "name"):
+                value = model.get(key)
+                if isinstance(value, str):
+                    candidate_tokens.update(self._identifier_tokens(value))
+
+            if search_tokens & candidate_tokens:
+                return model
+
         return None
-    
-    def _format_pricing(self, pricing: Optional[Dict[str, Any]]) -> str:
-        """Format pricing information for display."""
+
+    def _get_valid_models(self) -> List[ModelInfo]:
+        """Fetch and normalize models, filtering malformed entries."""
+        raw_models = self.client.fetch_models()
+        normalized: List[ModelInfo] = []
+        for raw_model in raw_models:
+            normalized_model = self._normalize_model_schema(raw_model)
+            if normalized_model:
+                normalized.append(normalized_model)
+        return normalized
+
+    def _normalize_model_schema(self, raw_model: Any) -> Optional[ModelInfo]:
+        """Validate and normalize the structure of a raw model entry."""
+        if not isinstance(raw_model, dict):
+            return None
+
+        identifier = raw_model.get("id") or raw_model.get("name")
+        if not isinstance(identifier, str) or not identifier.strip():
+            return None
+
+        normalized: ModelInfo = {}
+
+        for key in (
+            "id",
+            "name",
+            "owned_by",
+            "organization",
+            "provider",
+            "permalink",
+        ):
+            value = raw_model.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized[key] = value.strip()
+
+        description = raw_model.get("description")
+        if isinstance(description, str) and description.strip():
+            normalized["description"] = description.strip()
+
+        for key in ("context_length", "max_context", "context"):
+            value = raw_model.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                normalized[key] = int(value)
+
+        for key in (
+            "input_modalities",
+            "output_modalities",
+            "modality",
+            "supported_parameters",
+        ):
+            value = raw_model.get(key)
+            if isinstance(value, (list, tuple, set)):
+                cleaned = [
+                    str(item).strip()
+                    for item in value
+                    if isinstance(item, str) and item.strip()
+                ]
+                if cleaned:
+                    normalized[key] = cleaned
+
+        for key in ("supports_images", "tools", "function_calling", "json_output"):
+            value = raw_model.get(key)
+            if isinstance(value, bool):
+                normalized[key] = value
+
+        provider_key = self._determine_provider_key(raw_model)
+        pricing = self._normalize_pricing_data(
+            raw_model.get("pricing"),
+            provider_key,
+        )
+        if pricing:
+            normalized["pricing"] = pricing
+
+        normalized = self._apply_provider_adapters(normalized, provider_key)
+        return normalized
+
+    def _determine_provider_key(self, model: Dict[str, Any]) -> str:
+        """Derive a normalized provider key used for adapter lookups."""
+        provider_value = (
+            model.get("provider")
+            or model.get("owned_by")
+            or model.get("organization")
+            or ""
+        )
+        if isinstance(provider_value, str):
+            return provider_value.strip().lower()
+        return ""
+
+    def _apply_provider_adapters(
+        self,
+        model: ModelInfo,
+        provider_key: str,
+    ) -> ModelInfo:
+        """Apply provider-specific schema adjustments."""
+        adapter = self._provider_schema_adapters().get(provider_key)
+        if not adapter:
+            return model
+        return adapter(model)
+
+    def _provider_schema_adapters(
+        self,
+    ) -> Dict[str, Callable[[ModelInfo], ModelInfo]]:
+        """Expose schema adapter registry for provider normalization."""
+        return {
+            "anthropic": self._anthropic_adapter,
+            "google": self._google_adapter,
+        }
+
+    @staticmethod
+    def _anthropic_adapter(model: ModelInfo) -> ModelInfo:
+        """Adapt Anthropic metadata to expose prompt caching support."""
+        adapted = cast(ModelInfo, dict(model))
+        pricing = adapted.get("pricing", {})
+        params = list(
+            dict.fromkeys(adapted.get("supported_parameters", []) or [])
+        )
+
+        if any(key.startswith("cache") for key in pricing):
+            if "prompt_caching" not in params:
+                params.append("prompt_caching")
+
+        if params:
+            adapted["supported_parameters"] = params
+
+        return adapted
+
+    @staticmethod
+    def _google_adapter(model: ModelInfo) -> ModelInfo:
+        """Ensure Google modality data is reflected in output modalities."""
+        adapted = cast(ModelInfo, dict(model))
+        modalities = adapted.get("modality", []) or []
+        outputs = list(
+            dict.fromkeys(adapted.get("output_modalities", []) or [])
+        )
+
+        for modality in modalities:
+            if modality not in outputs:
+                outputs.append(modality)
+
+        if outputs:
+            adapted["output_modalities"] = outputs
+
+        return adapted
+
+    def _normalize_pricing_data(
+        self,
+        pricing: Any,
+        provider_key: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """Normalize pricing values across provider schemas."""
         if not isinstance(pricing, dict):
-            return "—"
-        
-        parts = []
-        if "prompt" in pricing:
-            parts.append(f"Input: ${pricing['prompt']}/1M tok")
-        if "completion" in pricing:
-            parts.append(f"Output: ${pricing['completion']}/1M tok")
-        
-        # Add other pricing fields if present
+            return {}
+
+        normalized: Dict[str, float] = {}
+        alias_map = dict(self._PRICING_KEY_ALIASES)
+
+        if provider_key:
+            provider_aliases = self._PROVIDER_PRICING_OVERRIDES.get(provider_key, {})
+            for target, aliases in provider_aliases.items():
+                existing = alias_map.get(target, ())
+                alias_map[target] = existing + tuple(
+                    alias for alias in aliases if alias not in existing
+                )
+
+        for target_field, aliases in alias_map.items():
+            for alias in aliases:
+                if alias in pricing and target_field not in normalized:
+                    decimal_value = self._coerce_decimal(pricing[alias])
+                    if decimal_value is not None:
+                        normalized[target_field] = float(decimal_value)
+                        break
+
         for key, value in pricing.items():
-            if key not in ("prompt", "completion"):
-                parts.append(f"{key.capitalize()}: ${value}")
-        
+            if key in alias_map:
+                continue
+            decimal_value = self._coerce_decimal(value)
+            if decimal_value is not None:
+                normalized[key] = float(decimal_value)
+
+        return normalized
+
+    def _coerce_decimal(self, value: Any) -> Optional[Decimal]:
+        """Convert pricing data into a :class:`Decimal` when possible."""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, Decimal):
+            return value
+        if isinstance(value, (int, float)):
+            return Decimal(str(value))
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned:
+                return None
+            match = re.search(r"(\d+(?:\.\d+)?)", cleaned.replace(",", ""))
+            if not match:
+                return None
+            cleaned_value = match.group(1)
+            try:
+                return Decimal(cleaned_value)
+            except InvalidOperation:
+                return None
+        return None
+
+    def _format_decimal(self, value: float) -> str:
+        """Format a numeric value without introducing exponent notation."""
+        decimal_value = self._coerce_decimal(value)
+        if decimal_value is None:
+            return "0"
+
+        normalized = decimal_value.normalize()
+        if normalized == normalized.to_integral():
+            return str(normalized.to_integral())
+
+        text = format(normalized, "f").rstrip("0").rstrip(".")
+        return text or "0"
+    
+    def _format_pricing(
+        self,
+        pricing: Optional[Dict[str, Any]],
+        provider_key: Optional[str] = None,
+    ) -> str:
+        """Format pricing information for display."""
+        normalized = self._normalize_pricing_data(pricing, provider_key)
+        if not normalized:
+            return "—"
+
+        parts: List[str] = []
+        for field in ("prompt", "completion"):
+            if field in normalized:
+                label = "Input" if field == "prompt" else "Output"
+                formatted = self._format_decimal(normalized[field])
+                parts.append(f"{label}: ${formatted}/1M tok")
+
+        for key in sorted(normalized):
+            if key in ("prompt", "completion"):
+                continue
+            formatted = self._format_decimal(normalized[key])
+            parts.append(f"{key.capitalize()}: ${formatted}")
+
         return ", ".join(parts) if parts else "—"
+
+    def _identifier_tokens(self, value: str) -> Set[str]:
+        """Create a set of comparable tokens for identifier matching."""
+        normalized = self._normalize_identifier(value)
+        if not normalized:
+            return set()
+
+        tokens = {normalized}
+        canonical = normalized.replace("_", "-")
+        tokens.add(canonical)
+        tokens.add(canonical.replace("-", " "))
+        tokens.add(normalized.replace(" ", ""))
+
+        if "/" in normalized:
+            _, remainder = normalized.split("/", 1)
+            tokens.add(remainder)
+            remainder_dash = remainder.replace("_", "-")
+            tokens.add(remainder_dash)
+            tokens.add(remainder_dash.replace("-", " "))
+            tokens.add(remainder.replace(" ", ""))
+
+        return {token for token in tokens if token}
+
+    @staticmethod
+    def _normalize_identifier(value: str) -> str:
+        """Normalize an identifier for comparison."""
+        return value.strip().lower()
+
+    def _sort_model_choices(
+        self,
+        choices: Sequence[Tuple[str, str]],
+    ) -> List[Tuple[str, str]]:
+        """Sort model choices by preferred priority and then identifier."""
+        preferred = self.client.config.preferred_models
+        priority_map = {
+            self._normalize_identifier(model): index
+            for index, model in enumerate(preferred)
+        }
+
+        sorted_choices = sorted(
+            choices,
+            key=lambda item: (
+                priority_map.get(
+                    self._normalize_identifier(item[1]),
+                    self._DEFAULT_PRIORITY_RANK,
+                ),
+                self._normalize_identifier(item[1]),
+            ),
+        )
+        return list(sorted_choices)
+
+    def _render_markdown_template(self, context: Dict[str, str]) -> str:
+        """Render the markdown template with the provided context."""
+        return self._MARKDOWN_TEMPLATE.format(**context)
+
+    @staticmethod
+    def _escape_markdown(value: str) -> str:
+        """Escape markdown-sensitive characters."""
+        escaped = value.replace("\\", "\\\\")
+        for char in ("`", "[", "]"):
+            escaped = escaped.replace(char, f"\\{char}")
+        return escaped
     
     def _extract_capabilities(self, model: ModelInfo) -> List[str]:
         """Extract model capabilities for display."""
-        capabilities = []
-        
-        if (model.get("supports_images") or 
-            "image" in (model.get("input_modalities") or [])):
+        capabilities: List[str] = []
+
+        input_modalities = (
+            model.get("input_modalities") or model.get("modality") or []
+        )
+        if model.get("supports_images") or "image" in [
+            entry.lower() for entry in input_modalities
+        ]:
             capabilities.append("Image-in")
-        
-        params = model.get("supported_parameters", [])
-        if model.get("tools") or "tools" in params:
+
+        params = model.get("supported_parameters", []) or []
+        normalized_params = [param.lower() for param in params]
+        if model.get("tools") or "tools" in normalized_params:
             capabilities.append("Tools")
-        if model.get("function_calling") or "function_calling" in params:
+        if model.get("function_calling") or "function_calling" in normalized_params:
             capabilities.append("Func-calls")
-        if model.get("json_output") or "response_format" in params:
+        if model.get("json_output") or "response_format" in normalized_params:
             capabilities.append("JSON-mode")
-        
+        if "prompt_caching" in normalized_params:
+            capabilities.append("Prompt-cache")
+
         return capabilities
     
     def build_model_markdown(self, model_id: str) -> str:
         """
         Generate comprehensive markdown documentation for a model.
-        
+
         Args:
             model_id: The model identifier to document.
-            
+
         Returns:
             Formatted markdown string with model information.
         """
         model = self.find_model(model_id)
         if not model:
-            return f"### Model\n`{model_id}`\n\n*No metadata found from `/models` endpoint.*"
-        
-        # Extract basic information
+            return (
+                "### Model\n"
+                f"`{self._escape_markdown(model_id)}`\n\n"
+                "*No metadata found from `/models` endpoint.*"
+            )
+
+        provider_key = self._determine_provider_key(model)
+
         name = model.get("name") or model.get("id") or model_id
-        provider = (
-            model.get("owned_by") or 
-            model.get("organization") or 
-            model.get("provider") or 
-            "—"
+        provider_display = (
+            model.get("owned_by")
+            or model.get("organization")
+            or model.get("provider")
+            or "—"
         )
-        
-        # Build model URL
-        permalink = model.get("permalink")
-        if not permalink:
-            permalink = f"https://openrouter.ai/models/{model.get('id', model_id)}"
-        
-        # Extract technical specifications
+
+        permalink = model.get("permalink") or (
+            f"https://openrouter.ai/models/{model.get('id', model_id)}"
+        )
+
         context_length = (
-            model.get("context_length") or 
-            model.get("max_context") or 
-            model.get("context") or 
-            "—"
+            model.get("context_length")
+            or model.get("max_context")
+            or model.get("context")
+            or "—"
         )
-        
-        pricing = self._format_pricing(model.get("pricing"))
-        
-        # Extract modalities
+
+        pricing_display = self._format_pricing(
+            model.get("pricing"),
+            provider_key,
+        )
+
         input_modalities = ", ".join(
-            model.get("input_modalities", []) or 
-            model.get("modality", []) or 
-            ["text"]
+            model.get("input_modalities")
+            or model.get("modality")
+            or ["text"]
         )
         output_modalities = ", ".join(
-            model.get("output_modalities", []) or ["text"]
+            model.get("output_modalities") or ["text"]
         )
-        
-        # Format supported parameters
-        params = model.get("supported_parameters", [])
+
+        params = model.get("supported_parameters") or []
         if params:
-            sorted_params = sorted(set(params))
+            sorted_params = sorted(dict.fromkeys(params))
             params_display = ", ".join(sorted_params[:12])
             if len(sorted_params) > 12:
                 params_display += f" (+{len(sorted_params) - 12} more)"
         else:
             params_display = "—"
-        
-        # Extract capabilities
+
         capabilities = self._extract_capabilities(model)
         capabilities_display = ", ".join(capabilities) if capabilities else "—"
-        
-        # Format description
-        description = model.get("description", "").strip()
+
+        description = (model.get("description") or "").strip()
         if description:
             if len(description) > 560:
                 description = description[:560].rstrip() + "…"
         else:
             description = "—"
-        
-        # Build markdown sections
-        sections = [
-            f"### Model\n[`{name}`]({permalink})",
-            "",
-            f"**Provider:** `{provider}`",
-            "",
-            f"**Context length:** `{context_length}` tokens",
-            "",
-            f"**Pricing:** {pricing}",
-            "",
-            "**Modalities:**",
-            f"- Input: `{input_modalities}`",
-            f"- Output: `{output_modalities}`",
-            "",
-            f"**Supported params:** {params_display}",
-            "",
-            f"**Capabilities:** {capabilities_display}",
-            "",
-            "**Notes:**",
-            description,
-            "",
-            "> Data from OpenRouter **Models API**. Fields vary by provider.",
-        ]
-        
-        return "\n".join(sections)
+
+        context = {
+            "name": self._escape_markdown(name),
+            "permalink": permalink,
+            "provider": self._escape_markdown(str(provider_display)),
+            "context_length": self._escape_markdown(str(context_length)),
+            "pricing": pricing_display,
+            "input_modalities": self._escape_markdown(
+                input_modalities or "text"
+            ),
+            "output_modalities": self._escape_markdown(
+                output_modalities or "text"
+            ),
+            "supported_parameters": self._escape_markdown(params_display),
+            "capabilities": self._escape_markdown(capabilities_display),
+            "description": self._escape_markdown(description),
+        }
+
+        return self._render_markdown_template(context)
 
 
 # =============================================================================
@@ -767,15 +1125,13 @@ class GradioAgentLab:
             
             # Chat interface
             chat_interface = gr.ChatInterface(
-                fn=lambda messages, model, system, temp, max_tok, top_p_val, seed_val: 
+                fn=lambda messages, model, system, temp, max_tok, top_p_val, seed_val:
                     self.handle_chat_stream(
                         messages, model, system, temp, max_tok, top_p_val, seed_val
                     ),
                 type="messages",
                 fill_height=True,
                 autofocus=True,
-                retry_btn=None,
-                undo_btn="Delete last",
                 submit_btn="Send",
                 stop_btn="Stop",
                 additional_inputs=[
